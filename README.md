@@ -57,7 +57,7 @@ https://pengcgg.github.io/collect-iptv-fu/
 
 ## ⏱️ Last Run Time
 
-<!-- Last Run Time --> 2026-11-27 21:36:56 CST
+<!-- Last Run Time --> 2026-11-27 22:44:46 CST
 
 ## 🔗 Generated File Link
 

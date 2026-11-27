@@ -1,0 +1,120 @@
+{
+  "generated_at": "2026-11-27 22:44:45 CST",
+  "elapsed_seconds": 52.7,
+  "sources": [
+    {
+      "url": "https://tzdr.com/iptv.txt",
+      "ok": false,
+      "reason": "超时",
+      "entries": 0
+    },
+    {
+      "url": "https://live.kilvn.com/iptv.m3u",
+      "ok": false,
+      "reason": "连接失败",
+      "entries": 0
+    },
+    {
+      "url": "https://m3u.ibert.me/txt/fmml_itv.txt",
+      "ok": true,
+      "reason": "ok",
+      "entries": 189
+    },
+    {
+      "url": "https://gh-proxy.com/raw.githubusercontent.com/vbskycn/iptv/refs/heads/master/tv/iptv4.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 312
+    },
+    {
+      "url": "http://175.178.251.183:6689/live.m3u",
+      "ok": false,
+      "reason": "超时",
+      "entries": 0
+    },
+    {
+      "url": "https://raw.githubusercontent.com/suxuang/myIPTV/refs/heads/main/ipv4.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 1199
+    },
+    {
+      "url": "https://m3u.ibert.me/ycl_iptv.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 0
+    },
+    {
+      "url": "https://tv.iill.top/m3u/Gather",
+      "ok": true,
+      "reason": "ok",
+      "entries": 0
+    },
+    {
+      "url": "https://live.zbds.org/tv/iptv4.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 0
+    },
+    {
+      "url": "https://raw.githubusercontent.com/YueChan/Live/refs/heads/main/IPTV.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 0
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Kimentanm/aptv/master/m3u/iptv.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 119
+    },
+    {
+      "url": "https://raw.githubusercontent.com/BurningC4/Chinese-IPTV/master/TV-IPV4.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 58
+    },
+    {
+      "url": "https://raw.githubusercontent.com/zwc456baby/iptv_alive/refs/heads/master/live.m3u",
+      "ok": true,
+      "reason": "ok",
+      "entries": 30
+    },
+    {
+      "url": "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV_AutoUpdate.m3u8",
+      "ok": true,
+      "reason": "ok",
+      "entries": 50
+    }
+  ],
+  "total": 1812,
+  "alive": 283,
+  "dead": 1529,
+  "alive_ratio": 0.1562,
+  "protected": false,
+  "max_per_channel": 3,
+  "channels": 274,
+  "output_entries": 283,
+  "dead_reasons": {
+    "超时": 1331,
+    "HTTP 403": 192,
+    "子列表/分片不可用": 6
+  },
+  "config": {
+    "connect_timeout": 5,
+    "read_timeout": 10,
+    "retries": 1,
+    "workers": 40,
+    "deep_workers": 30,
+    "deep": true,
+    "fast_bytes": 4096,
+    "max_bytes": 8388608,
+    "sec_cap": 20,
+    "max_per_channel": 3,
+    "min_ratio": 0.05,
+    "min_items": 20,
+    "keep_non_http": true,
+    "protect_exit_code": 0,
+    "report": "check-report.json"
+  }
+}
