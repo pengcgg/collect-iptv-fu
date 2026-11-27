@@ -99,11 +99,3 @@ jobs:
           echo "PUSH_FAILED：三次重试仍未推上去"
           exit 1
 
-      - name: Upload check report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: check-report
-          path: check-report.json
-          if-no-files-found: ignore
-          retention-days: 7
