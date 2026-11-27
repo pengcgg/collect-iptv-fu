@@ -57,7 +57,7 @@
                         <i class="fa fa-list text-purple-500"></i>
                         <span>频道总数：<span id="channelCount" class="font-medium text-purple-600">-</span></span>
                     </div>
-                    <a href="https://github.com/zilong7728/Collect-IPTV" target="_blank" class="ml-auto flex items-center gap-1 hover:text-blue-600 transition-colors">
+                    <a id="repoLink" href="https://github.com/pengcgg/collect-iptv-fu" target="_blank" class="ml-auto flex items-center gap-1 hover:text-blue-600 transition-colors">
                         <i class="fa fa-github"></i> GitHub项目 <i class="fa fa-external-link"></i>
                     </a>
                 </div>
@@ -107,7 +107,18 @@
     </div>
 
     <script>
-        const README_URL = 'https://raw.githubusercontent.com/zilong7728/Collect-IPTV/refs/heads/main/README.md';
+        // 自动识别当前仓库：fork 之后网页读的是自己仓库的数据，不会串到上游
+        const IS_GH_PAGES = location.hostname.endsWith('github.io');
+        const GH_OWNER = IS_GH_PAGES ? location.hostname.split('.')[0] : 'pengcgg';
+        const _segs = location.pathname.split('/').filter(Boolean);
+        const GH_REPO = (_segs.length && !_segs[0].includes('.')) ? _segs[0] : 'collect-iptv-fu';
+        // GitHub Pages 上走 raw 地址；本地/自建托管用同目录相对文件
+        const RAW_BASE = IS_GH_PAGES
+            ? `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/refs/heads/main`
+            : '.';
+        const README_URL = `${RAW_BASE}/README.md`;
+        const repoLinkEl = document.getElementById('repoLink');
+        if (repoLinkEl) repoLinkEl.href = `https://github.com/${GH_OWNER}/${GH_REPO}`;
         let currentM3UUrl = '';
         let allChannels = [];
 
@@ -222,6 +233,12 @@
                 nameSpan.title = channel.name || '未知频道';
                 nameSpan.textContent = channel.name || '未知频道';
                 nameCell.appendChild(nameSpan);
+                if ((channel.sources || 1) > 1) {
+                    const badge = document.createElement('span');
+                    badge.className = 'inline-block mt-1 text-xs text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded';
+                    badge.textContent = `${channel.sources} 条备用源`;
+                    nameCell.appendChild(badge);
+                }
 
                 const categoryCell = document.createElement('td');
                 categoryCell.className = 'px-6 py-4 whitespace-nowrap text-sm';
@@ -295,7 +312,20 @@
                     currentChannel = {}; 
                 }
             });
-            return channels;
+
+            // 多源备用：同一个频道会出现多条（最多 MAX_PER_CHANNEL 条，
+            // 按延迟从快到慢）。网页上只展示第一条，并标出共有几条源。
+            const merged = new Map();
+            for (const ch of channels) {
+                const key = `${ch.category}|${ch.name}`;
+                const exist = merged.get(key);
+                if (exist) {
+                    exist.sources += 1;
+                } else {
+                    merged.set(key, { ...ch, sources: 1 });
+                }
+            }
+            return [...merged.values()];
         }
 
 		function extractUrlFromReadme(readmeText, format) {
@@ -350,7 +380,9 @@
                 if (timeMatch) el.githubUpdateTime.textContent = timeMatch[1];
 
                 const selectedFormat = el.formatFilter.value;
-                currentM3UUrl = extractUrlFromReadme(readmeText, selectedFormat);
+                currentM3UUrl = IS_GH_PAGES
+                    ? extractUrlFromReadme(readmeText, selectedFormat)
+                    : `best_sorted.${selectedFormat}`;
 
                 const m3uRes = await fetch(currentM3UUrl);
                 if (!m3uRes.ok) throw new Error(`获取 ${selectedFormat.toUpperCase()} 文件失败：${m3uRes.status}`);

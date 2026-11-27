@@ -1,40 +1,109 @@
 name: IPTV Daily Update
+
 on:
   schedule:
-    - cron: '0 */4 * * *'  
-  workflow_dispatch: 
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: '额外源地址（逗号分隔，可留空）'
+        required: false
+        default: ''
+      max_per_channel:
+        description: '每个频道最多保留几条源'
+        required: false
+        default: '3'
+
+permissions:
+  contents: write
+
 env:
   TZ: Asia/Shanghai
+  # 验真参数，想调直接改这里（都有默认值，删掉也能跑）
+  WORKERS: '40'            # 第一阶段并发
+  DEEP_WORKERS: '30'       # 下钻并发
+  DEEP: '1'                # 1=下钻到子列表/分片，0=只验主地址
+  TIMEOUT: '10'            # 单次读取超时（秒）
+  RETRIES: '1'             # 每个地址重试次数
+  MAX_PER_CHANNEL: '3'     # 每频道最多几条源（多源备用）
+  MIN_RATIO: '0.05'        # 有效率低于 5% 触发保护，不覆盖旧产物
+  MIN_ITEMS: '20'          # 有效条目少于 20 条也触发保护
+  PROTECT_EXIT_CODE: '0'   # 保护时是否让 CI 标红，0=不标红
+
 jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
+    concurrency:
+      group: iptv-update
+      cancel-in-progress: false
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-    - name: Set up Python
-      uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c
-      with:
-        python-version: '3.10'
-    - name: Install dependencies
-      run: pip install aiohttp
-    - name: Run scraping script
-      run: python .github/workflows/iptv.py
-    - name: GetTime
-      run: echo "GET_TIME=$(date +'%Y-%m-%d %H:%M:%S CST')" >> $GITHUB_ENV
-    - name: Update README.md with run time and file link
-      run: |
-        file_link="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref }}/best_sorted.m3u"  # 生成的文件是 best_sorted.m3u
-        file_link1="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref }}/best_sorted.m3u8"  # 生成的文件是 best_sorted.m3u
-        sed -i "s|<!-- Last Run Time -->.*|<!-- Last Run Time --> ${GET_TIME}|" README.md
-        sed -i "s|<!-- Generated File Link M3U -->.*|<!-- Generated File Link M3U --> [View M3U File](${file_link})|" README.md
-        sed -i "s|<!-- Generated File Link M3U8 -->.*|<!-- Generated File Link M3U8 --> [View M3U8 File](${file_link1})|" README.md
-    - name: Commit changes
-      env:
-        REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git remote set-url origin $REPO_URL
-        git add README.md best_sorted.m3u best_sorted.m3u8
-        git commit -am "自动更新：${GET_TIME}"
-        git push origin main
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install aiohttp
+
+      - name: Run scraping script
+        env:
+          EXTRA_SOURCES: ${{ github.event.inputs.sources }}
+          MAX_PER_CHANNEL: ${{ github.event.inputs.max_per_channel || '3' }}
+        run: python .github/workflows/iptv.py
+
+      - name: GetTime
+        run: echo "GET_TIME=$(date +'%Y-%m-%d %H:%M:%S CST')" >> $GITHUB_ENV
+
+      - name: Update README.md with run time and file link
+        run: |
+          BASE="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/main"
+          sed -i "s|<!-- Last Run Time -->.*|<!-- Last Run Time --> ${GET_TIME}|" README.md
+          sed -i "s|<!-- Generated File Link M3U -->.*|<!-- Generated File Link M3U --> [View M3U File](${BASE}/best_sorted.m3u)|" README.md
+          sed -i "s|<!-- Generated File Link M3U8 -->.*|<!-- Generated File Link M3U8 --> [View M3U8 File](${BASE}/best_sorted.m3u8)|" README.md
+
+      - name: Commit and push (with retry)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add README.md best_sorted.m3u best_sorted.m3u8
+          git add -f check-report.json 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "本轮没有变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "自动更新：${GET_TIME}"
+
+          for i in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "PUSH_OK（第 $i 次）"
+              exit 0
+            fi
+            echo "推送冲突，第 $i 次：先同步远端再重推"
+            git fetch origin main
+            git merge -X ours --no-edit origin/main || {
+              echo "自动合并失败，保留本次生成物"
+              git checkout --ours -- best_sorted.m3u best_sorted.m3u8 check-report.json 2>/dev/null || true
+              git add best_sorted.m3u best_sorted.m3u8 2>/dev/null || true
+              git add -f check-report.json 2>/dev/null || true
+              git commit -m "合并：保留本次生成物${GET_TIME}" || true
+            }
+            sleep $((i * 3))
+          done
+          echo "PUSH_FAILED：三次重试仍未推上去"
+          exit 1
+
+      - name: Upload check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-report
+          path: check-report.json
+          if-no-files-found: ignore
+          retention-days: 7

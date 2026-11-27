@@ -1,10 +1,12 @@
 import os
+import ssl
 import aiohttp
 import asyncio
 import time
 import json
 from collections import Counter, defaultdict
 import re
+from urllib.parse import urljoin, urlparse
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Any
 
 def contains_date(text):
@@ -24,10 +26,88 @@ def normalize_text_for_match(text: str) -> str:
 
 # 配置
 CONFIG = {
-    "timeout": 10,  # Timeout in seconds
-    "max_parallel": 30,  # Max concurrent requests
+    "timeout": 10,  # 地理词表等辅助请求的超时
     "output_file": "best_sorted.m3u",  # Output file for the sorted M3U
 }
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    return _env(name, "1" if default else "0") not in ("0", "false", "False", "no", "off")
+
+
+# ---------------------------------------------------------------- 验真参数
+# 全部可用环境变量覆盖，方便在 workflow 里调，不用改代码。
+PROBE = {
+    # 建连超时单独设短一点：坏域名不会把整轮拖住
+    "connect_timeout": max(2, _env_int("CONNECT_TIMEOUT", 5)),
+    # 单次读取超时
+    "read_timeout": max(3, _env_int("TIMEOUT", 10)),
+    # 重试次数（0 表示不重试）
+    "retries": max(0, _env_int("RETRIES", 1)),
+    # 第一阶段并发
+    "workers": max(1, _env_int("WORKERS", 40)),
+    # 第二阶段（下钻）并发
+    "deep_workers": max(1, _env_int("DEEP_WORKERS", 30)),
+    # 是否下钻到子列表/首个分片。关掉只验主地址，快很多但会放进更多假活源
+    "deep": _env_bool("DEEP", True),
+    # 首包只读这么多
+    "fast_bytes": max(1024, _env_int("FAST_BYTES", 4096)),
+    # 单次拉取体积上限，防源站抽风灌爆内存
+    "max_bytes": max(65536, _env_int("MAX_BYTES", 8 * 1024 * 1024)),
+    # 单条 URL 总耗时上限
+    "sec_cap": max(5, _env_int("SEC_PER_URL_CAP", 20)),
+    # 每个频道最多留几条源（多源备用）
+    "max_per_channel": max(1, _env_int("MAX_PER_CHANNEL", 3)),
+    # 有效率保护：低于这个比例就认为上游整体挂了，不覆盖旧产物
+    "min_ratio": _env_float("MIN_RATIO", 0.05),
+    # 总条目数低于这个值也触发保护
+    "min_items": _env_int("MIN_ITEMS", 20),
+    # 非 http(s) 协议（rtmp/rtsp/p3p 等）无法用 HTTP 验真，默认保留
+    "keep_non_http": _env_bool("KEEP_NON_HTTP", True),
+    # 触发保护时是否让 CI 标红。默认 0 = 不标红（保护是正常行为，不是故障）
+    "protect_exit_code": max(0, _env_int("PROTECT_EXIT_CODE", 0)),
+    # 探测报告落盘路径，空则不写
+    "report": _env("REPORT", "check-report.json"),
+}
+
+UA_BROWSER = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+UA_VLC = "VLC/3.0.20 LibVLC/3.0.20"
+UA_MPV = "mpv 0.37.0"
+UA_ROTATION = (UA_BROWSER, UA_VLC, UA_MPV)
+
+HLS_CONTENT_TYPES = (
+    "application/vnd.apple.mpegurl",
+    "application/x-mpegurl",
+    "audio/mpegurl",
+    "audio/x-mpegurl",
+    "application/mpegurl",
+)
+
+# 有的 IPTV 源证书过期/自签，验真阶段不该因此判死（只是探测，不承载敏感数据）
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 CHAR_NORMALIZATION_MAP = str.maketrans({
     "頻": "频",
@@ -749,29 +829,28 @@ def deduplicate_candidate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dic
     return deduplicated
 
 
+def entry_score(entry: Dict[str, Any]) -> Tuple[Any, ...]:
+    """排序分：延迟越低越好，https 优先，短地址优先（短地址通常不带一堆参数）。"""
+    latency = entry.get("latency")
+    if not isinstance(latency, (int, float)):
+        latency = float("inf")
+    url = str(entry.get("url", ""))
+    return (latency, 0 if url.startswith("https://") else 1, len(url))
+
+
 def choose_better_entry(current_best: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
-    best_latency = current_best.get("latency")
-    cand_latency = candidate.get("latency")
-    best_score = (
-        best_latency if isinstance(best_latency, (int, float)) else float("inf"),
-        0 if str(current_best.get("url", "")).startswith("https://") else 1,
-        len(str(current_best.get("url", ""))),
-    )
-    cand_score = (
-        cand_latency if isinstance(cand_latency, (int, float)) else float("inf"),
-        0 if str(candidate.get("url", "")).startswith("https://") else 1,
-        len(str(candidate.get("url", ""))),
-    )
-    return candidate if cand_score < best_score else current_best
+    return candidate if entry_score(candidate) < entry_score(current_best) else current_best
 
 
 def select_best_streams(valid_entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    去重并选优：
+    去重并按频道分组选优：
     1) 同频道同 URL 去重
-    2) 同频道保留最低延迟（并优先 https）的最佳 URL
+    2) 每个频道按延迟排序，保留前 MAX_PER_CHANNEL 条做多源备用
+       （一条挂了播放器可以换下一条，不至于整台消失）
     """
-    best_by_channel: Dict[str, Dict[str, Any]] = {}
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    seen: Set[Tuple[str, str]] = set()
 
     for entry in valid_entries:
         channel = sanitize_channel_name(str(entry.get("channel", "")).strip())
@@ -780,13 +859,22 @@ def select_best_streams(valid_entries: Iterable[Dict[str, Any]]) -> List[Dict[st
             continue
 
         key = channel_identity_key(channel)
-        current = best_by_channel.get(key)
-        if current is None:
-            best_by_channel[key] = dict(entry)
-        else:
-            best_by_channel[key] = choose_better_entry(current, entry)
+        pair = (key, url)
+        if pair in seen:
+            continue
+        seen.add(pair)
 
-    selected = list(best_by_channel.values())
+        normalized_entry = dict(entry)
+        normalized_entry["channel"] = channel
+        normalized_entry["url"] = url
+        grouped[key].append(normalized_entry)
+
+    per_channel = PROBE["max_per_channel"]
+    selected: List[Dict[str, Any]] = []
+    for key, entries in grouped.items():
+        entries.sort(key=entry_score)
+        selected.extend(entries[:per_channel])
+
     selected.sort(key=lambda x: natural_sort_key(str(x.get("channel", ""))))
     return selected
 
@@ -839,70 +927,313 @@ def extract_urls_from_m3u(content):
     return urls
 
 
-# 测试 IPTV 链接的可用性和速度
-async def test_stream(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str):
-    """测试 IPTV 链接的可用性和速度"""
-    async with semaphore:
-        start_time = time.time()
+# ---------------------------------------------------------------- 验真器
+# 思路来自两阶段探测：先只读首包判断「拿不拿得到数据、是不是 HLS」，
+# 是 HLS 再下钻一层到子列表/首个分片。只回 HTTP 200 的假活源（会员过期页、
+# 欢迎页、错误页）在这一步会被判死。
+
+def decode_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", "replace")
+    for enc in ("utf-8", "gb18030", "big5", "latin-1"):
         try:
-            async with session.get(url, timeout=CONFIG["timeout"]) as response:
-                if response.status == 200:
-                    elapsed_time = time.time() - start_time
-                    return True, elapsed_time
-                return False, None
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def is_http_url(url: str) -> bool:
+    try:
+        return urlparse(url).scheme.lower() in ("http", "https")
+    except ValueError:
+        return False
+
+
+def first_uri(text: str) -> str:
+    """取播放列表里第一个非注释行（master 里是子列表地址，media 里是首个分片）。"""
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def looks_like_hls(url: str, content_type: str, head_text: str) -> bool:
+    if "#EXTM3U" in head_text:
+        return True
+    path = urlparse(url).path.lower()
+    if path.endswith(".m3u8") or path.endswith(".m3u"):
+        return True
+    ct = (content_type or "").lower()
+    return any(k in ct for k in HLS_CONTENT_TYPES)
+
+
+def looks_like_web_page(content_type: str, head_text: str) -> bool:
+    low = head_text[:512].lstrip().lower()
+    if low.startswith("<!doctype") or low.startswith("<html") or low.startswith("<?xml"):
+        return True
+    return "text/html" in (content_type or "").lower()
+
+
+def make_timeout(total: Optional[float] = None) -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=total or PROBE["sec_cap"],
+        connect=PROBE["connect_timeout"],
+    )
+
+
+async def fetch_bytes_limited(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: Optional[float] = None,
+    referer: str = "",
+    limit: Optional[int] = None,
+    retries: int = 0,
+):
+    """流式拉取，带体积上限。返回 (ok, bytes 或 失败原因)。"""
+    limit = limit or PROBE["max_bytes"]
+    last = "unknown"
+    headers = {"User-Agent": UA_BROWSER, "Accept": "*/*"}
+    if referer:
+        headers["Referer"] = referer
+
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=make_timeout(timeout),
+                allow_redirects=True,
+                ssl=_SSL_CTX,
+            ) as resp:
+                if resp.status >= 400:
+                    last = "HTTP %d" % resp.status
+                    retryable = resp.status in (408, 425, 429) or resp.status >= 500
+                    if not retryable:
+                        return False, last
+                else:
+                    buf = bytearray()
+                    too_big = False
+                    async for chunk in resp.content.iter_chunked(65536):
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > limit:
+                            too_big = True
+                            break
+                    if too_big:
+                        return False, "响应过大(>%dMB)" % (limit // (1024 * 1024))
+                    return True, bytes(buf)
         except asyncio.TimeoutError:
-            return False, None
-        except Exception:
-            return False, None
+            last = "超时"
+        except aiohttp.ClientSSLError:
+            last = "SSL 错误"
+        except aiohttp.ClientConnectorError:
+            last = "连接失败"
+        except aiohttp.ClientError as exc:
+            last = type(exc).__name__
+        except Exception as exc:  # noqa: BLE001
+            last = type(exc).__name__
+
+        if attempt < retries:
+            await asyncio.sleep(0.6 * (attempt + 1))
+
+    return False, last
 
 
-# 测试多个 IPTV 链接
+async def probe_playlist(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    text: str,
+    depth: int = 0,
+):
+    """对一个 HLS 播放列表下钻：master -> 子列表 -> 首个分片；media -> 首个分片。"""
+    uri = first_uri(text)
+    if not uri:
+        return False, "播放列表为空"
+
+    target = urljoin(base_url, uri)
+    ok, data = await fetch_bytes_limited(
+        session, target, timeout=PROBE["read_timeout"], referer=base_url, retries=1
+    )
+    if not ok:
+        return False, "子列表/分片不可用(%s)" % data
+
+    body = decode_bytes(data[:32768])
+    if not body.strip():
+        return False, "子列表/分片为空"
+
+    # 还有一层（master 套 media）时再钻一次，最多两层，防无限嵌套
+    if "#EXTM3U" in body and depth < 1:
+        return await probe_playlist(session, target, body, depth + 1)
+
+    return True, "ok"
+
+
+async def test_stream(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str):
+    """验证单个源，返回 (状态, 延迟秒, 原因)。
+
+    状态：
+      "ok"   —— 确认可播（非 HLS 已读到流数据 / HLS 已下钻到分片）
+      "skip" —— 非 http(s) 协议（rtmp/rtsp 等），HTTP 验不了，按配置保留
+      "dead" —— 确定失效
+    """
+    url = (url or "").strip()
+    if not url:
+        return "dead", None, "空地址"
+
+    if not is_http_url(url):
+        if PROBE["keep_non_http"]:
+            return "skip", None, "非 http 协议，未验证保留"
+        return "dead", None, "非 http 协议"
+
+    started = time.time()
+    last = "unknown"
+    use_range = True
+
+    async with semaphore:
+        for attempt in range(PROBE["retries"] + 1):
+            if time.time() - started > PROBE["sec_cap"]:
+                return "dead", None, "超时(%s)" % last
+
+            ua = UA_ROTATION[attempt % len(UA_ROTATION)]
+            headers = {"User-Agent": ua, "Accept": "*/*"}
+            if use_range:
+                headers["Range"] = "bytes=0-%d" % (PROBE["fast_bytes"] - 1)
+
+            try:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=make_timeout(),
+                    allow_redirects=True,
+                    ssl=_SSL_CTX,
+                ) as resp:
+                    code = resp.status
+                    if code >= 400:
+                        last = "HTTP %d" % code
+                        # 少数服务器不认 Range（403/416），去掉 Range 再试一次
+                        if code in (403, 416) and use_range:
+                            use_range = False
+                            continue
+                        if (code in (408, 425, 429) or code >= 500) and attempt < PROBE["retries"]:
+                            await asyncio.sleep(0.6 * (attempt + 1))
+                            continue
+                        return "dead", None, last
+
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    head = await resp.content.read(PROBE["fast_bytes"])
+                    latency = time.time() - started
+
+                if not head:
+                    last = "空响应"
+                    if attempt < PROBE["retries"]:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    return "dead", None, last
+
+                text = decode_bytes(head)
+
+                if looks_like_hls(url, ctype, text):
+                    # 结构检查要严格：必须以 #EXTM3U 开头。
+                    # 普通文本里"提到" #EXTM3U（比如文档），不算播放列表。
+                    if not text.lstrip().startswith("#EXTM3U"):
+                        last = "m3u8 结构异常"
+                        if attempt < PROBE["retries"]:
+                            await asyncio.sleep(0.6 * (attempt + 1))
+                            continue
+                        return "dead", None, last
+                    if not PROBE["deep"]:
+                        return "ok", latency, "ok(未下钻)"
+                    ok, reason = await probe_playlist(session, url, text)
+                    if ok:
+                        return "ok", latency, "ok"
+                    return "dead", None, reason
+
+                # 非 m3u8：读到流数据才算活，返回网页/报错页的判死
+                if looks_like_web_page(ctype, text):
+                    last = "返回网页而非流"
+                    if attempt < PROBE["retries"]:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    return "dead", None, last
+
+                return "ok", latency, "ok"
+
+            except asyncio.TimeoutError:
+                last = "超时"
+            except aiohttp.ClientSSLError:
+                last = "SSL 错误"
+            except aiohttp.ClientConnectorError:
+                last = "连接失败"
+            except aiohttp.ClientError as exc:
+                last = type(exc).__name__
+            except Exception as exc:  # noqa: BLE001
+                last = type(exc).__name__
+
+            # 已经耗掉一半预算就不再重试，避免个别源把整轮拖住
+            if attempt < PROBE["retries"] and time.time() - started < PROBE["sec_cap"] / 2.0:
+                continue
+            break
+
+    return "dead", None, last
+
+
 async def test_multiple_streams(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
-    entries: Iterable[Dict[str, Any]]
-):
-    """测试多个 IPTV 链接"""
-    tasks = [test_stream(session, semaphore, str(entry.get("url", "")).strip()) for entry in entries]
-    results = await asyncio.gather(*tasks)
-    return results
+    urls: Iterable[str],
+) -> Dict[str, Tuple[str, Optional[float], str]]:
+    """并发验证一批 URL，同一个地址只验一次。"""
+    unique_urls = []
+    seen = set()
+    for url in urls:
+        u = str(url or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+
+    tasks = [test_stream(session, semaphore, u) for u in unique_urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    out: Dict[str, Tuple[str, Optional[float], str]] = {}
+    for url, result in zip(unique_urls, results):
+        if isinstance(result, Exception):
+            out[url] = ("dead", None, type(result).__name__)
+        else:
+            out[url] = result
+    return out
 
 
-# 读取文件并提取 URL（支持 M3U 或 TXT 格式）
+# 读取源文件并提取条目（不在这里验真，全局去重后统一验，省掉重复请求）
 async def read_and_test_file(
     session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
     file_path: str,
-    is_m3u: bool = False
+    is_m3u: bool = False,
 ):
-    """读取文件并提取 URL 进行测试"""
-    try:
-        async with session.get(file_path, timeout=CONFIG["timeout"]) as response:
-            if response.status != 200:
-                return []
-            content = await response.text(errors="ignore")
+    ok, data = await fetch_bytes_limited(
+        session,
+        file_path,
+        timeout=PROBE["read_timeout"],
+        retries=PROBE["retries"],
+        limit=PROBE["max_bytes"],
+    )
+    if not ok:
+        print(f"  [源不可用] {file_path} -> {data}")
+        return [], {"url": file_path, "ok": False, "reason": data, "entries": 0}
 
-        if is_m3u:
-            entries = extract_urls_from_m3u(content)
-        else:
-            entries = extract_urls_from_txt(content)
-        entries = deduplicate_candidate_entries(entries)
+    content = decode_bytes(data)
+    if is_m3u:
+        entries = extract_urls_from_m3u(content)
+    else:
+        entries = extract_urls_from_txt(content)
+    entries = deduplicate_candidate_entries(entries)
+    print(f"  [源可用] {file_path} -> {len(entries)} 条")
+    return entries, {"url": file_path, "ok": True, "reason": "ok", "entries": len(entries)}
 
-        valid_entries: List[Dict[str, Any]] = []
-        results = await test_multiple_streams(session, semaphore, entries)
-        for (is_valid, latency), entry in zip(results, entries):
-            if is_valid:
-                valid_entries.append({
-                    "channel": entry["channel"],
-                    "url": entry["url"],
-                    "source_group_title": entry.get("source_group_title"),
-                    "latency": latency,
-                })
-
-        return valid_entries
-
-    except Exception:
-        return []
 
 
 # 生成排序后的 M3U 和 M3U8 文件
@@ -994,13 +1325,15 @@ def generate_sorted_m3u(valid_entries, cctv_channels, province_channels, filenam
     # 生成 m3u8 的文件名 (将后缀 .m3u 替换为 .m3u8)
     m3u8_filename = filename.replace('.m3u', '.m3u8')
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
-    
+    unique_channels = len({channel_identity_key(c['channel']) for c in all_channels})
+
     # 写入 M3U 和 M3U8 文件
     for fname in [filename, m3u8_filename]:
         with open(fname, 'w', encoding='utf-8') as f:
             f.write("#EXTM3U\n")
             f.write(f"# Generated-Time: {generated_at}\n")
-            f.write(f"# Channel-Count: {len(all_channels)}\n")
+            f.write(f"# Channel-Count: {unique_channels}\n")
+            f.write(f"# Source-Count: {len(all_channels)}\n")
             for channel_info in all_channels:
                 f.write(
                     f"#EXTINF:-1 tvg-name=\"{channel_info['channel']}\" tvg-logo=\"{channel_info['logo']}\" group-title=\"{channel_info['group_title']}\",{channel_info['channel']}\n")
@@ -1025,22 +1358,39 @@ def load_province_channels(files):
     return province_channels
 
 
+def write_report(path, payload):
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"Report written: {path}")
+    except OSError as exc:
+        print(f"Report write failed: {exc}")
+
+
 # 主函数：处理多个文件并生成 M3U 输出
 async def main(file_urls, cctv_channel_file, province_channel_files):
-    """主函数处理多个文件"""
-    # 加载 CCTV 频道列表
-    cctv_channels = load_cctv_channels(cctv_channel_file)
+    """主函数处理多个文件：抓源 -> 全局去重 -> 两阶段验真 -> 多源选优 -> 输出"""
+    started_at = time.time()
 
-    # 加载多个省份频道列表
+    # 加载 CCTV 频道列表与省份频道列表
+    cctv_channels = load_cctv_channels(cctv_channel_file)
     province_channels = load_province_channels(province_channel_files)
 
-    all_valid_entries: List[Dict[str, Any]] = []
-    semaphore = asyncio.Semaphore(CONFIG["max_parallel"])
+    semaphore = asyncio.Semaphore(PROBE["workers"])
+    connector = aiohttp.TCPConnector(limit=PROBE["workers"] * 2, ssl=_SSL_CTX)
+    timeout = make_timeout(PROBE["sec_cap"])
 
-    timeout = aiohttp.ClientTimeout(total=CONFIG["timeout"])
-    connector = aiohttp.TCPConnector(limit=CONFIG["max_parallel"] * 2)
-    async with aiohttp.ClientSession(cookie_jar=None, timeout=timeout, connector=connector) as session:
-        online_geo_tokens = await load_online_geo_tokens(session, province_channels)
+    all_entries: List[Dict[str, Any]] = []
+    source_stats: List[Dict[str, Any]] = []
+
+    async with aiohttp.ClientSession(cookie_jar=None, timeout=timeout, connector=connector, trust_env=True) as session:
+        # 地理词表（拿不到就用本地省份 txt，不影响主流程）
+        try:
+            online_geo_tokens = await load_online_geo_tokens(session, province_channels)
+        except Exception:  # noqa: BLE001
+            online_geo_tokens = {}
         if online_geo_tokens:
             for province, tokens in online_geo_tokens.items():
                 province_channels[province].update(tokens)
@@ -1048,23 +1398,90 @@ async def main(file_urls, cctv_channel_file, province_channel_files):
         else:
             print("Online geo tokens unavailable, fallback to local province txt only.")
 
-        for file_url in file_urls:
-            if file_url.endswith(('.m3u', '.m3u8')):
-                valid_entries = await read_and_test_file(session, semaphore, file_url, is_m3u=True)
-            elif file_url.endswith('.txt'):
-                valid_entries = await read_and_test_file(session, semaphore, file_url, is_m3u=False)
-            else:
-                valid_entries = []
+        # 并发拉取所有源（单个源挂掉不影响其它源）
+        fetch_tasks = [
+            read_and_test_file(session, u, is_m3u=u.endswith(('.m3u', '.m3u8')))
+            for u in file_urls
+        ]
+        fetched = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        for file_url, item in zip(file_urls, fetched):
+            if isinstance(item, Exception):
+                reason = type(item).__name__
+                print(f"  [源不可用] {file_url} -> {reason}")
+                source_stats.append({"url": file_url, "ok": False, "reason": reason, "entries": 0})
+                continue
+            entries, stat = item
+            all_entries.extend(entries)
+            source_stats.append(stat)
 
-            all_valid_entries.extend(valid_entries)
+        deduplicated = deduplicate_candidate_entries(all_entries)
+        print(f"抓取条目 {len(all_entries)}，全局去重后 {len(deduplicated)}")
 
-    deduplicated_entries = deduplicate_candidate_entries(all_valid_entries)
-    best_entries = select_best_streams(deduplicated_entries)
-    print(f"Valid streams: {len(all_valid_entries)}, deduplicated: {len(deduplicated_entries)}, best-per-channel: {len(best_entries)}")
+        # 同一个地址只验一次
+        results = await test_multiple_streams(
+            session, semaphore, [e["url"] for e in deduplicated]
+        )
 
-    # 生成排序后的 M3U 文件
+    valid_entries: List[Dict[str, Any]] = []
+    dead_reasons: Counter = Counter()
+    for entry in deduplicated:
+        status, latency, reason = results.get(entry["url"], ("dead", None, "未探测"))
+        if status in ("ok", "skip"):
+            item = dict(entry)
+            item["latency"] = latency
+            item["probe"] = status
+            valid_entries.append(item)
+        else:
+            dead_reasons[str(reason).split("(")[0]] += 1
+
+    total = len(deduplicated)
+    alive = len(valid_entries)
+    ratio = (alive / total) if total else 0.0
+    elapsed = time.time() - started_at
+
+    print(
+        f"验真完成：有效 {alive} / 共 {total}"
+        f"（有效率 {ratio * 100:.1f}%，耗时 {elapsed:.0f}s）"
+    )
+    if dead_reasons:
+        top = "、".join(f"{k} {v}" for k, v in dead_reasons.most_common(6))
+        print(f"失效原因 TOP：{top}")
+
+    # 有效率保护：上游整体异常时不覆盖旧产物，避免把列表清空
+    protected = total < PROBE["min_items"] or ratio < PROBE["min_ratio"]
+    best_entries = [] if protected else select_best_streams(valid_entries)
+
+    report = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()),
+        "elapsed_seconds": round(elapsed, 1),
+        "sources": source_stats,
+        "total": total,
+        "alive": alive,
+        "dead": total - alive,
+        "alive_ratio": round(ratio, 4),
+        "protected": protected,
+        "max_per_channel": PROBE["max_per_channel"],
+        "channels": len({channel_identity_key(e["channel"]) for e in best_entries}),
+        "output_entries": len(best_entries),
+        "dead_reasons": dict(dead_reasons.most_common(20)),
+        "config": {k: v for k, v in PROBE.items()},
+    }
+    write_report(PROBE["report"], report)
+
+    if protected:
+        print(
+            f"触发保护（有效 {alive}/{total}，低于阈值），本次不覆盖输出文件，"
+            f"保留上一版 best_sorted.m3u。上游恢复后下一轮会自动更新。"
+        )
+        return PROBE["protect_exit_code"]
+
+    # 生成排序后的 M3U / M3U8
     generate_sorted_m3u(best_entries, cctv_channels, province_channels, CONFIG["output_file"])
-    print(f"Generated sorted M3U file: {CONFIG['output_file']}")
+    print(
+        f"Generated {CONFIG['output_file']}: "
+        f"{report['channels']} 个频道 / {report['output_entries']} 条源"
+    )
+    return 0
 
 
 if __name__ == "__main__":
@@ -1085,6 +1502,10 @@ if __name__ == "__main__":
         "https://raw.githubusercontent.com/zwc456baby/iptv_alive/refs/heads/master/live.m3u",
         "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV_AutoUpdate.m3u8"
     ]
+
+    # 额外源：用环境变量 EXTRA_SOURCES 追加（逗号分隔），方便临时加源不用改代码
+    extra = [u.strip() for u in _env("EXTRA_SOURCES").split(",") if u.strip()]
+    file_urls.extend(extra)
 
     # CCTV 频道文件（例如 IPTV/CCTV.txt）
     cctv_channel_file = ".github/workflows/IPTV/CCTV.txt"
@@ -1125,4 +1546,5 @@ if __name__ == "__main__":
     ]
 
     # 执行主函数
-    asyncio.run(main(file_urls, cctv_channel_file, province_channel_files))
+    import sys
+    sys.exit(asyncio.run(main(file_urls, cctv_channel_file, province_channel_files)))
