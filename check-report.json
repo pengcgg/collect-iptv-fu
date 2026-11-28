@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-28 07:57:10 CST",
-  "elapsed_seconds": 56.9,
+  "generated_at": "2026-11-28 15:04:29 CST",
+  "elapsed_seconds": 57.7,
   "sources": [
     {
       "url": "https://tzdr.com/iptv.txt",
@@ -24,7 +24,7 @@
       "url": "https://gh-proxy.com/raw.githubusercontent.com/vbskycn/iptv/refs/heads/master/tv/iptv4.m3u",
       "ok": true,
       "reason": "ok",
-      "entries": 340
+      "entries": 337
     },
     {
       "url": "http://175.178.251.183:6689/live.m3u",
@@ -87,19 +87,18 @@
       "entries": 51
     }
   ],
-  "total": 1826,
-  "alive": 339,
-  "dead": 1487,
-  "alive_ratio": 0.1857,
+  "total": 1825,
+  "alive": 274,
+  "dead": 1551,
+  "alive_ratio": 0.1501,
   "protected": false,
   "max_per_channel": 3,
-  "channels": 328,
-  "output_entries": 339,
+  "channels": 264,
+  "output_entries": 274,
   "dead_reasons": {
-    "超时": 1276,
+    "超时": 1347,
     "HTTP 403": 192,
-    "子列表/分片不可用": 14,
-    "HTTP 404": 5
+    "子列表/分片不可用": 12
   },
   "config": {
     "connect_timeout": 5,
